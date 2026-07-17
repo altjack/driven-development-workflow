@@ -1,0 +1,100 @@
+{
+  "docs": {
+    "author": {
+      "provider": "claude",
+      "model": "claude-fable-5",
+      "effort": "high"
+    },
+    "reviewer": {
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "xhigh",
+      "sandbox": "read-only"
+    },
+    "fallbacks": [
+      {
+        "on": {"role": "author", "provider": "claude", "model": "claude-fable-5"},
+        "to": {
+          "author": {"provider": "codex", "model": "gpt-5.6-sol", "effort": "xhigh", "sandbox": "workspace-write"},
+          "reviewer": {"provider": "claude", "model": "claude-opus-4-8", "effort": "max"}
+        }
+      },
+      {
+        "on": {"role": "reviewer", "provider": "codex", "model": "gpt-5.6-sol"},
+        "to": {
+          "author": {"provider": "claude", "model": "claude-fable-5", "effort": "high"},
+          "reviewer": {"provider": "codex", "model": "gpt-5.6-terra", "effort": "xhigh", "sandbox": "read-only"}
+        }
+      },
+      {
+        "on": {"role": "author", "provider": "codex", "model": "gpt-5.6-sol"},
+        "to": {
+          "author": {"provider": "codex", "model": "gpt-5.6-terra", "effort": "max", "sandbox": "workspace-write"},
+          "reviewer": {"provider": "claude", "model": "claude-opus-4-8", "effort": "max"}
+        }
+      },
+      {
+        "on": {"role": "author", "provider": "codex", "model": "gpt-5.6-terra"},
+        "stop": "needs_user"
+      },
+      {
+        "on": {"role": "reviewer", "provider": "codex", "model": "gpt-5.6-terra"},
+        "stop": "needs_user"
+      },
+      {
+        "on": {"role": "reviewer", "provider": "claude", "model": "claude-opus-4-8"},
+        "stop": "needs_user"
+      }
+    ]
+  },
+  "code": {
+    "author": {
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "effort": "xhigh",
+      "sandbox": "workspace-write"
+    },
+    "reviewer": {
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "high",
+      "sandbox": "read-only"
+    },
+    "fallbacks": [
+      {
+        "on": {"role": "author", "provider": "codex", "model": "gpt-5.6-terra"},
+        "stop": "needs_user"
+      },
+      {
+        "on": {"role": "reviewer", "provider": "codex", "model": "gpt-5.6-sol"},
+        "stop": "needs_user"
+      }
+    ]
+  },
+  "e2e": {
+    "author": {
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "high",
+      "sandbox": "workspace-write"
+    },
+    "reviewer": {
+      "provider": "claude",
+      "model": "claude-fable-5",
+      "effort": "high"
+    },
+    "fallbacks": [
+      {
+        "on": {"role": "author", "provider": "codex", "model": "gpt-5.6-sol"},
+        "stop": "needs_user"
+      },
+      {
+        "on": {"role": "reviewer", "provider": "claude", "model": "claude-fable-5"},
+        "stop": "needs_user"
+      }
+    ]
+  },
+  "limits": {
+    "max_reviews": 3
+  }
+}

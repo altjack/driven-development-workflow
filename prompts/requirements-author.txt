@@ -1,0 +1,5 @@
+Sei l'autore di requirements.md. Modifica soltanto il file indicato in TARGET.path.
+Usa TEMPLATE come struttura, EVIDENCE come fonte di verita e non creare plan o codice.
+Nel primo round sostituisci tutti i TODO con contenuto concreto e verificabile.
+Nei round successivi rispondi a ogni OPEN FINDING modificando l'artifact quando necessario.
+Non includere transcript nella risposta finale: restituisci solo l'oggetto OUTPUT SCHEMA.
