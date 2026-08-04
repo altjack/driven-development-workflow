@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Deterministic feature workflow runner."""
 
 from __future__ import annotations
@@ -17,9 +16,16 @@ from uuid import uuid4
 
 
 CONFIG_PATH = Path(__file__).with_name("workflow.json")
+CONFIG_SCHEMA_PATH = Path(__file__).with_name("workflow.schema.json")
 PROMPTS_DIR = Path(__file__).with_name("prompts")
 TEMPLATES_DIR = Path(__file__).with_name("templates")
 MAIN_BRANCHES = {"main", "master"}
+CONFIG_VERSION = 1
+WORKFLOW_NAMES = ("docs", "code", "e2e")
+ROLES = ("author", "reviewer")
+PROVIDERS = {"claude", "codex"}
+EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
+CODEX_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
 
 
 class ProviderFailure(ValueError):
@@ -38,29 +44,197 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def load_config() -> dict:
-    config = json.loads(CONFIG_PATH.read_text())
-    for name in ("docs", "code", "e2e"):
-        workflow = config[name]
-        pairs = [(workflow["author"], workflow["reviewer"])]
-        triggers = set()
-        for transition in workflow.get("fallbacks", []):
-            trigger = transition["on"]
-            key = (trigger["role"], trigger["provider"], trigger["model"])
-            if key in triggers:
-                raise ValueError(f"duplicate fallback transition: {key}")
-            triggers.add(key)
+def config_error(path: str, message: str) -> ValueError:
+    return ValueError(f"invalid workflow config at {path}: {message}")
+
+
+def validate_keys(
+    value: dict,
+    required: set[str],
+    optional: set[str],
+    path: str,
+) -> None:
+    missing = required - set(value)
+    if missing:
+        raise config_error(path, f"missing keys: {', '.join(sorted(missing))}")
+    unknown = set(value) - required - optional
+    if unknown:
+        raise config_error(path, f"unknown keys: {', '.join(sorted(unknown))}")
+
+
+def validate_route(route: object, path: str) -> None:
+    if not isinstance(route, dict):
+        raise config_error(path, "must be an object")
+    validate_keys(route, {"provider", "model", "effort"}, {"sandbox"}, path)
+    provider = route["provider"]
+    if not isinstance(provider, str) or provider not in PROVIDERS:
+        raise config_error(f"{path}.provider", f"must be one of {sorted(PROVIDERS)}")
+    if not isinstance(route["model"], str) or not route["model"].strip():
+        raise config_error(f"{path}.model", "must be a non-empty string")
+    if not isinstance(route["effort"], str) or route["effort"] not in EFFORTS:
+        raise config_error(f"{path}.effort", f"must be one of {sorted(EFFORTS)}")
+    if provider == "codex":
+        sandbox = route.get("sandbox")
+        if not isinstance(sandbox, str) or sandbox not in CODEX_SANDBOXES:
+            raise config_error(
+                f"{path}.sandbox",
+                f"is required for Codex and must be one of {sorted(CODEX_SANDBOXES)}",
+            )
+    elif "sandbox" in route:
+        raise config_error(f"{path}.sandbox", "is only supported by Codex")
+
+
+def route_identity(route: dict) -> tuple[str, str]:
+    return route["provider"], route["model"]
+
+
+def validate_pair(author: dict, reviewer: dict, path: str) -> None:
+    if author["model"] == reviewer["model"]:
+        raise config_error(path, "author and reviewer must use different models")
+
+
+def validate_workflow(workflow: object, path: str) -> None:
+    if not isinstance(workflow, dict):
+        raise config_error(path, "must be an object")
+    validate_keys(workflow, {"author", "reviewer", "fallbacks"}, set(), path)
+    for role in ROLES:
+        validate_route(workflow[role], f"{path}.{role}")
+    validate_pair(workflow["author"], workflow["reviewer"], path)
+    if not isinstance(workflow["fallbacks"], list):
+        raise config_error(f"{path}.fallbacks", "must be an array")
+
+    transitions = {}
+    for index, transition in enumerate(workflow["fallbacks"]):
+        transition_path = f"{path}.fallbacks[{index}]"
+        if not isinstance(transition, dict):
+            raise config_error(transition_path, "must be an object")
+        validate_keys(transition, {"on"}, {"to", "stop"}, transition_path)
+        if ("to" in transition) == ("stop" in transition):
+            raise config_error(transition_path, "must define exactly one of to or stop")
+        trigger = transition["on"]
+        if not isinstance(trigger, dict):
+            raise config_error(f"{transition_path}.on", "must be an object")
+        validate_keys(
+            trigger,
+            {"role", "provider", "model"},
+            set(),
+            f"{transition_path}.on",
+        )
+        if not isinstance(trigger["role"], str) or trigger["role"] not in ROLES:
+            raise config_error(
+                f"{transition_path}.on.role", f"must be one of {list(ROLES)}"
+            )
+        if (
+            not isinstance(trigger["provider"], str)
+            or trigger["provider"] not in PROVIDERS
+        ):
+            raise config_error(
+                f"{transition_path}.on.provider",
+                f"must be one of {sorted(PROVIDERS)}",
+            )
+        if not isinstance(trigger["model"], str) or not trigger["model"].strip():
+            raise config_error(
+                f"{transition_path}.on.model", "must be a non-empty string"
+            )
+        trigger_key = (
+            trigger["role"],
+            trigger["provider"],
+            trigger["model"],
+        )
+        if trigger_key in transitions:
+            raise config_error(transition_path, f"duplicate fallback trigger: {trigger_key}")
+        transitions[trigger_key] = transition
+
+        if "to" in transition:
+            target = transition["to"]
+            if not isinstance(target, dict):
+                raise config_error(f"{transition_path}.to", "must be an object")
+            validate_keys(target, set(ROLES), set(), f"{transition_path}.to")
+            for role in ROLES:
+                validate_route(target[role], f"{transition_path}.to.{role}")
+            validate_pair(
+                target["author"],
+                target["reviewer"],
+                f"{transition_path}.to",
+            )
+            failed_target = target[trigger["role"]]
+            if route_identity(failed_target) == (
+                trigger["provider"],
+                trigger["model"],
+            ):
+                raise config_error(
+                    f"{transition_path}.to.{trigger['role']}",
+                    "must change the failed provider or model",
+                )
+        elif transition["stop"] != "needs_user":
+            raise config_error(
+                f"{transition_path}.stop", "must be exactly needs_user"
+            )
+
+    initial = (workflow["author"], workflow["reviewer"])
+    pending = [initial]
+    reachable_states = set()
+    reachable_triggers = set()
+    while pending:
+        author, reviewer = pending.pop()
+        state_key = (route_identity(author), route_identity(reviewer))
+        if state_key in reachable_states:
+            continue
+        reachable_states.add(state_key)
+        for role, route in zip(ROLES, (author, reviewer)):
+            trigger_key = (role, *route_identity(route))
+            transition = transitions.get(trigger_key)
+            if transition is None:
+                raise config_error(
+                    f"{path}.fallbacks",
+                    f"missing terminal or fallback for reachable {role} route "
+                    f"{route['provider']}/{route['model']}",
+                )
+            reachable_triggers.add(trigger_key)
             if "to" in transition:
-                if transition["to"][trigger["role"]]["model"] == trigger["model"]:
-                    raise ValueError("fallback must change the failed model")
-                pairs.append((transition["to"]["author"], transition["to"]["reviewer"]))
-            elif transition.get("stop") != "needs_user":
-                raise ValueError("fallback must define to or stop=needs_user")
-        if any(author["model"] == reviewer["model"] for author, reviewer in pairs):
-            raise ValueError(f"{name} author and reviewer must use different models")
-    if not 1 <= config["limits"]["max_reviews"] <= 3:
-        raise ValueError("max_reviews must be between 1 and 3")
+                pending.append(
+                    (transition["to"]["author"], transition["to"]["reviewer"])
+                )
+
+    unreachable = set(transitions) - reachable_triggers
+    if unreachable:
+        trigger = sorted(unreachable)[0]
+        raise config_error(
+            f"{path}.fallbacks",
+            f"unreachable fallback trigger: {trigger}",
+        )
+
+
+def validate_config(config: object) -> dict:
+    if not isinstance(config, dict):
+        raise config_error("$", "must be an object")
+    validate_keys(
+        config,
+        {"version", *WORKFLOW_NAMES, "limits"},
+        set(),
+        "$",
+    )
+    if isinstance(config["version"], bool) or config["version"] != CONFIG_VERSION:
+        raise config_error(
+            "$.version", f"must be the supported version {CONFIG_VERSION}"
+        )
+    for name in WORKFLOW_NAMES:
+        validate_workflow(config[name], f"$.{name}")
+    limits = config["limits"]
+    if not isinstance(limits, dict):
+        raise config_error("$.limits", "must be an object")
+    validate_keys(limits, {"max_reviews"}, set(), "$.limits")
+    max_reviews = limits["max_reviews"]
+    if isinstance(max_reviews, bool) or not isinstance(max_reviews, int):
+        raise config_error("$.limits.max_reviews", "must be an integer")
+    if not 1 <= max_reviews <= 3:
+        raise config_error("$.limits.max_reviews", "must be between 1 and 3")
     return config
+
+
+def load_config(path: Path | None = None) -> dict:
+    config_path = path or CONFIG_PATH
+    return validate_config(json.loads(config_path.read_text()))
 
 
 def workflow_config(config: dict, unit: str) -> dict:
@@ -147,6 +321,22 @@ def commit_code(root: Path, branch: str, base_commit: str) -> str:
     return result
 
 
+def commit_artifacts(root: Path, branch: str) -> str:
+    feature_dir = root / "specs" / "features" / branch
+    paths = [
+        str((feature_dir / name).relative_to(root))
+        for name in ("requirements.md", "plan.md", "validation.md", "review-ledger.md")
+        if (feature_dir / name).is_file()
+    ]
+    if len(paths) != 4:
+        raise ValueError("cannot commit incomplete workflow artifacts")
+    git(root, "add", "--", *paths)
+    if not git(root, "status", "--porcelain", "--", *paths):
+        raise ValueError("workflow artifacts have no changes to commit")
+    git(root, "commit", "-m", f"feature-flow: {branch} artifacts", "--", *paths)
+    return git(root, "rev-parse", "HEAD")
+
+
 def has_real_requirements(path: Path) -> bool:
     if not path.is_file():
         return False
@@ -166,7 +356,9 @@ def has_real_plan(path: Path) -> bool:
     if not path.is_file():
         return False
     text = path.read_text(errors="replace")
-    return "TODO" not in text.upper() and bool(re.search(r"(?m)^\s*-\s+\[[ xX]\]\s+", text))
+    return not re.search(r"(?i)\bTODO\b", text) and bool(
+        re.search(r"(?m)^\s*-\s+\[[ xX]\]\s+", text)
+    )
 
 
 def has_real_validation(path: Path) -> bool:
@@ -337,7 +529,20 @@ def inspect_repo(repo: Path, unit: str | None = None) -> dict:
         "hash": target_hash,
         "accepted": accepted,
     }
-    if accepted:
+    operational_finalization = bool(
+        (
+            operational.get("repo"),
+            operational.get("branch"),
+            operational.get("unit"),
+        )
+        == (str(root), branch, unit)
+        and operational.get("status") in {"running", "needs_user"}
+        and (
+            operational.get("phase") == "artifact_decision"
+            or operational.get("resume_phase") == "artifact_decision"
+        )
+    )
+    if accepted and not operational_finalization:
         result.update(
             state=f"{artifact.stem}_accepted",
             next={"action": "stop", "reason": "launcher slice not implemented"},
@@ -362,6 +567,12 @@ def inspect_repo(repo: Path, unit: str | None = None) -> dict:
             result["operational"]["finding"] = operational["finding"].get("id", "unknown")
         if operational["status"] == "needs_user":
             result.update(state="needs_user", next={"action": "stop", "reason": "needs_user"})
+            return result
+        if operational.get("phase") == "artifact_decision":
+            result.update(
+                state="validation_finalizing",
+                next={"unit": unit, "action": "commit_artifacts"},
+            )
             return result
         role = "author" if operational.get("phase") == "author_needed" else "reviewer"
     else:
@@ -1027,6 +1238,8 @@ def public_state(state: dict, state_dir: Path) -> dict:
         )
     elif state["unit"] == "validation.md":
         result["tests_run"] = len(state.get("tests", []))
+        if state.get("artifact_commit"):
+            result["artifact_commit"] = state["artifact_commit"]
     if state.get("finding"):
         finding = state["finding"]
         result.update(
@@ -1076,9 +1289,12 @@ def resolve_finding(repo: Path, finding_id: str, answer: str) -> dict:
             if ledger.stat().st_size:
                 output.write("\n")
             unit = state["unit"]
+            ledger_artifact = (
+                "workflow-artifacts" if finding_id == "commit_artifacts" else unit
+            )
             output.write(
                 f"## {unit} - resolution {finding_id}\n"
-                f"artifact: {unit}\n"
+                f"artifact: {ledger_artifact}\n"
                 f"finding: {finding_id}\n"
                 f"answer: {answer}\n"
                 "status: resolved\n"
@@ -1182,6 +1398,51 @@ def run_artifact(repo: Path, unit: str, provider=None) -> dict:
         stale_changes = 0
 
         while state["status"] == "running":
+            if state["phase"] == "artifact_decision":
+                resolution = next(
+                    (
+                        item
+                        for item in reversed(state.get("resolutions", []))
+                        if item.get("id") == "commit_artifacts"
+                    ),
+                    None,
+                )
+                answer = (resolution or {}).get("user_answer", "").strip().lower()
+                if answer == "commit":
+                    try:
+                        artifact_commit = commit_artifacts(root, branch)
+                    except ValueError:
+                        needs_user(
+                            state,
+                            {
+                                "id": "artifact_commit_failed",
+                                "question": "Commit degli artifact fallito",
+                            },
+                        )
+                        write_json(state_file, state)
+                        break
+                    state["artifact_commit"] = {
+                        "status": "committed",
+                        "commit": artifact_commit,
+                    }
+                elif answer == "leave uncommitted":
+                    state["artifact_commit"] = {"status": "skipped"}
+                else:
+                    needs_user(
+                        state,
+                        {
+                            "id": "commit_artifacts",
+                            "question": "Rispondi con commit oppure leave uncommitted",
+                            "choices": ["commit", "leave uncommitted"],
+                        },
+                        "artifact_decision",
+                    )
+                    write_json(state_file, state)
+                    break
+                state.update(status="accepted", phase="closed", findings=[])
+                write_json(state_file, state)
+                break
+
             if state["phase"] == "author_needed":
                 open_findings = state.get("findings", [])
                 calls += 1
@@ -1347,25 +1608,48 @@ def run_artifact(repo: Path, unit: str, provider=None) -> dict:
             if review.get("reviewed_hash") != reviewed_hash:
                 raise ValueError("reviewer returned the wrong hash")
             findings = review.get("findings", [])
-            if (
-                not isinstance(findings, list)
-                or (review["status"] == "accepted" and findings)
-                or (review["status"] == "needs_changes" and not findings)
-                or (review["status"] == "needs_user" and len(findings) != 1)
+            if not isinstance(findings, list) or (
+                review["status"] == "needs_changes" and not findings
             ):
-                raise ValueError("reviewer returned invalid findings")
+                needs_user(
+                    state,
+                    {
+                        "id": "reviewer_output",
+                        "question": "Review non conforme: findings incoerenti con status",
+                    },
+                    "review_needed",
+                )
+                write_json(state_file, state)
+                break
+            if review["status"] == "needs_changes" and all(
+                finding.get("severity") == "minor" for finding in findings
+            ):
+                # ponytail: i minor restano nel ledger ma non costano un round di riscrittura
+                review = {**review, "status": "accepted"}
 
             state["review_round"] += 1
             if review["status"] == "accepted" and unit == "code":
                 state["result_commit"] = state["working_commit"]
             append_review(ledger, state["review_round"], reviewed_hash, state, review)
             if review["status"] == "accepted":
+                if unit == "validation.md":
+                    needs_user(
+                        state,
+                        {
+                            "id": "commit_artifacts",
+                            "question": "Vuoi committare gli artifact del workflow?",
+                            "choices": ["commit", "leave uncommitted"],
+                        },
+                        "artifact_decision",
+                    )
+                    write_json(state_file, state)
+                    break
                 state.update(status="accepted", phase="closed", findings=[])
                 write_json(state_file, state)
                 break
             if review["status"] == "needs_user":
                 decision = findings[0] if findings else {"id": "reviewer_decision"}
-                state["findings"] = [decision]
+                state["findings"] = findings or [decision]
                 needs_user(state, decision, "author_needed")
                 write_json(state_file, state)
                 break
@@ -1415,19 +1699,30 @@ def parser() -> argparse.ArgumentParser:
     resolve.add_argument("finding")
     resolve.add_argument("--answer", required=True)
     resolve.add_argument("--repo", type=Path, default=Path("."))
+    validate = commands.add_parser("validate-config")
+    validate.add_argument("--config", type=Path, default=CONFIG_PATH)
     return cli
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        if args.command == "resolve":
+        if args.command == "validate-config":
+            config = load_config(args.config)
+            result = {
+                "status": "valid",
+                "config": str(args.config.resolve()),
+                "version": config["version"],
+                "workflows": list(WORKFLOW_NAMES),
+            }
+        elif args.command == "resolve":
             result = resolve_finding(args.repo, args.finding, args.answer)
         elif args.command == "run" and not args.dry_run:
             result = run_docs(args.repo, run_fake if args.fake else None)
         else:
             result = inspect_repo(args.repo)
-        result["dry_run"] = args.command == "run" and args.dry_run
+        if args.command == "run":
+            result["dry_run"] = args.dry_run
         print(json.dumps(result, separators=(",", ":")))
         return 0
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:

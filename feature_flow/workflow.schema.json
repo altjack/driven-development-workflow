@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://feature-flow.local/schemas/workflow-v1.json",
+  "title": "Feature Flow workflow configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "docs", "code", "e2e", "limits"],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "docs": {
+      "$ref": "#/$defs/workflow"
+    },
+    "code": {
+      "$ref": "#/$defs/workflow"
+    },
+    "e2e": {
+      "$ref": "#/$defs/workflow"
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_reviews"],
+      "properties": {
+        "max_reviews": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3
+        }
+      }
+    }
+  },
+  "$defs": {
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model", "effort"],
+      "properties": {
+        "provider": {
+          "enum": ["claude", "codex"]
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
+        },
+        "sandbox": {
+          "enum": ["read-only", "workspace-write", "danger-full-access"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "provider": {
+                "const": "codex"
+              }
+            },
+            "required": ["provider"]
+          },
+          "then": {
+            "required": ["sandbox"]
+          },
+          "else": {
+            "not": {
+              "required": ["sandbox"]
+            }
+          }
+        }
+      ]
+    },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "provider", "model"],
+      "properties": {
+        "role": {
+          "enum": ["author", "reviewer"]
+        },
+        "provider": {
+          "enum": ["claude", "codex"]
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["author", "reviewer"],
+      "properties": {
+        "author": {
+          "$ref": "#/$defs/route"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/route"
+        }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["on"],
+      "properties": {
+        "on": {
+          "$ref": "#/$defs/trigger"
+        },
+        "to": {
+          "$ref": "#/$defs/target"
+        },
+        "stop": {
+          "const": "needs_user"
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["to"],
+          "not": {
+            "required": ["stop"]
+          }
+        },
+        {
+          "required": ["stop"],
+          "not": {
+            "required": ["to"]
+          }
+        }
+      ]
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["author", "reviewer", "fallbacks"],
+      "properties": {
+        "author": {
+          "$ref": "#/$defs/route"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/route"
+        },
+        "fallbacks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/transition"
+          }
+        }
+      }
+    }
+  }
+}

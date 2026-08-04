@@ -1,0 +1,1 @@
+"""Bundled workflow artifact templates."""

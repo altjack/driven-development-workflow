@@ -1,36 +1,30 @@
 {
+  "version": 1,
   "docs": {
     "author": {
-      "provider": "claude",
-      "model": "claude-fable-5",
-      "effort": "high"
-    },
-    "reviewer": {
       "provider": "codex",
       "model": "gpt-5.6-sol",
       "effort": "xhigh",
-      "sandbox": "read-only"
+      "sandbox": "workspace-write"
+    },
+    "reviewer": {
+      "provider": "claude",
+      "model": "claude-opus-5",
+      "effort": "high"
     },
     "fallbacks": [
       {
-        "on": {"role": "author", "provider": "claude", "model": "claude-fable-5"},
-        "to": {
-          "author": {"provider": "codex", "model": "gpt-5.6-sol", "effort": "xhigh", "sandbox": "workspace-write"},
-          "reviewer": {"provider": "claude", "model": "claude-opus-4-8", "effort": "max"}
-        }
-      },
-      {
-        "on": {"role": "reviewer", "provider": "codex", "model": "gpt-5.6-sol"},
-        "to": {
-          "author": {"provider": "claude", "model": "claude-fable-5", "effort": "high"},
-          "reviewer": {"provider": "codex", "model": "gpt-5.6-terra", "effort": "xhigh", "sandbox": "read-only"}
-        }
-      },
-      {
         "on": {"role": "author", "provider": "codex", "model": "gpt-5.6-sol"},
         "to": {
-          "author": {"provider": "codex", "model": "gpt-5.6-terra", "effort": "max", "sandbox": "workspace-write"},
-          "reviewer": {"provider": "claude", "model": "claude-opus-4-8", "effort": "max"}
+          "author": {"provider": "codex", "model": "gpt-5.6-terra", "effort": "xhigh", "sandbox": "workspace-write"},
+          "reviewer": {"provider": "claude", "model": "claude-opus-5", "effort": "high"}
+        }
+      },
+      {
+        "on": {"role": "reviewer", "provider": "claude", "model": "claude-opus-5"},
+        "to": {
+          "author": {"provider": "codex", "model": "gpt-5.6-sol", "effort": "xhigh", "sandbox": "workspace-write"},
+          "reviewer": {"provider": "codex", "model": "gpt-5.6-terra", "effort": "xhigh", "sandbox": "read-only"}
         }
       },
       {
@@ -39,10 +33,6 @@
       },
       {
         "on": {"role": "reviewer", "provider": "codex", "model": "gpt-5.6-terra"},
-        "stop": "needs_user"
-      },
-      {
-        "on": {"role": "reviewer", "provider": "claude", "model": "claude-opus-4-8"},
         "stop": "needs_user"
       }
     ]
@@ -80,8 +70,8 @@
     },
     "reviewer": {
       "provider": "claude",
-      "model": "claude-fable-5",
-      "effort": "high"
+      "model": "claude-opus-5",
+      "effort": "xhigh"
     },
     "fallbacks": [
       {
@@ -89,7 +79,7 @@
         "stop": "needs_user"
       },
       {
-        "on": {"role": "reviewer", "provider": "claude", "model": "claude-fable-5"},
+        "on": {"role": "reviewer", "provider": "claude", "model": "claude-opus-5"},
         "stop": "needs_user"
       }
     ]

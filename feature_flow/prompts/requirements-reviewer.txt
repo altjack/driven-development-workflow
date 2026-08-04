@@ -3,4 +3,8 @@ Verifica allineamento alla roadmap, scope e out-of-scope, requisiti osservabili,
 vincoli, rischi e open question bloccanti. Applica una review Ponytail: segnala solo cambi necessari.
 Usa esattamente TARGET.hash come reviewed_hash. accepted richiede findings vuoti; ogni altro finding
 deve avere id, severity, owner, evidence, issue, required_change e why.
+Emetti needs_changes solo per finding che bloccano l'accettazione: ogni round costa una riscrittura
+completa. Le note non bloccanti vanno con severity minor: restano nel ledger e non riaprono il gate.
+Usa needs_user solo per decisioni di prodotto o trade-off che EVIDENCE non permette di risolvere,
+con un solo finding, owner user e una question esplicita per l'utente.
 Non includere transcript nella risposta finale: restituisci solo l'oggetto OUTPUT SCHEMA.

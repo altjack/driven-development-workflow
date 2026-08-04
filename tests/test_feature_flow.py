@@ -1,8 +1,10 @@
 import contextlib
+import copy
 import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -108,6 +110,9 @@ class FeatureFlowTest(unittest.TestCase):
     def test_code_and_e2e_slices_hash_targets_and_keep_new_sessions(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
             repo, feature_dir = self._repo(directory)
+            config = feature_flow.load_config()
+            code_config = config["code"]
+            e2e_config = config["e2e"]
             (repo / "app.py").write_text("VALUE = 1\n")
             subprocess.run(
                 ["git", "-C", str(repo), "config", "user.name", "Feature Flow Test"],
@@ -165,13 +170,22 @@ class FeatureFlowTest(unittest.TestCase):
                 validation_state = json.loads(
                     (Path(result["state_dir"]) / "state.json").read_text()
                 )
+                pending_commit_status = feature_flow.inspect_repo(repo)
+                tracked_before_consent = set(
+                    feature_flow.git(repo, "ls-files", "specs/features").splitlines()
+                )
+                feature_flow.resolve_finding(repo, "commit_artifacts", "commit")
+                validation_result = feature_flow.run_docs(repo, provider)
                 final_status = feature_flow.inspect_repo(repo)
                 fake_change = repo / "feature-flow-fake-change.txt"
                 fake_change.write_text(fake_change.read_text() + "tampered\n")
                 regressed_status = feature_flow.inspect_repo(repo)
 
             self.assertEqual(next_step["next"]["unit"], "code")
-            self.assertEqual(next_step["routing"]["author"]["model"], "gpt-5.6-terra")
+            self.assertEqual(
+                next_step["routing"]["author"]["model"],
+                code_config["author"]["model"],
+            )
             self.assertEqual((result["status"], result["unit"], result["review_round"]), ("accepted", "code", 1))
             self.assertEqual(result["base_commit"], base_commit)
             self.assertNotEqual(result["result_commit"], base_commit)
@@ -181,8 +195,18 @@ class FeatureFlowTest(unittest.TestCase):
             self.assertEqual(
                 code_calls,
                 [
-                    ("author", "gpt-5.6-terra", "xhigh", None),
-                    ("reviewer", "gpt-5.6-sol", "high", None),
+                    (
+                        "author",
+                        code_config["author"]["model"],
+                        code_config["author"]["effort"],
+                        None,
+                    ),
+                    (
+                        "reviewer",
+                        code_config["reviewer"]["model"],
+                        code_config["reviewer"]["effort"],
+                        None,
+                    ),
                 ],
             )
             self.assertNotIn("do-not-copy", "".join(code_prompts))
@@ -195,17 +219,46 @@ class FeatureFlowTest(unittest.TestCase):
             self.assertIn("python3 -m unittest: passed", ledger)
             self.assertIn(f"result_commit: {result['result_commit']}", ledger)
             self.assertEqual(validation_step["next"]["unit"], "validation.md")
-            self.assertEqual(validation_step["routing"]["author"]["model"], "gpt-5.6-sol")
+            self.assertEqual(
+                validation_step["routing"]["author"]["model"],
+                e2e_config["author"]["model"],
+            )
             self.assertEqual(
                 (validation_result["status"], validation_result["unit"], validation_result["tests_run"]),
                 ("accepted", "validation.md", 1),
+            )
+            self.assertEqual(pending_commit_status["state"], "needs_user")
+            self.assertEqual(
+                pending_commit_status["operational"]["finding"],
+                "commit_artifacts",
+            )
+            self.assertEqual(tracked_before_consent, set())
+            self.assertEqual(validation_result["artifact_commit"]["status"], "committed")
+            self.assertEqual(
+                feature_flow.git(repo, "show", "--format=", "--name-only", "HEAD").splitlines(),
+                [
+                    str((feature_dir / "plan.md").relative_to(repo)),
+                    str((feature_dir / "requirements.md").relative_to(repo)),
+                    str((feature_dir / "review-ledger.md").relative_to(repo)),
+                    str((feature_dir / "validation.md").relative_to(repo)),
+                ],
             )
             self.assertTrue(feature_flow.has_real_validation(feature_dir / "validation.md"))
             self.assertEqual(
                 e2e_calls,
                 [
-                    ("author", "gpt-5.6-sol", "high", None),
-                    ("reviewer", "claude-fable-5", "high", None),
+                    (
+                        "author",
+                        e2e_config["author"]["model"],
+                        e2e_config["author"]["effort"],
+                        None,
+                    ),
+                    (
+                        "reviewer",
+                        e2e_config["reviewer"]["model"],
+                        e2e_config["reviewer"]["effort"],
+                        None,
+                    ),
                 ],
             )
             self.assertNotIn("do-not-copy", "".join(e2e_prompts))
@@ -238,11 +291,46 @@ class FeatureFlowTest(unittest.TestCase):
             )
             self.assertEqual(resumed["session_id"], first["session_id"])
 
+    def test_artifact_commit_can_be_skipped_after_consent(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
+            repo, feature_dir = self._repo(directory)
+            (repo / "app.py").write_text("VALUE = 1\n")
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Feature Flow Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-m", "base"],
+                check=True,
+                capture_output=True,
+            )
+
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                for _ in range(4):
+                    result = feature_flow.run_docs(repo, feature_flow.run_fake)
+                self.assertEqual((result["status"], result["finding"]), ("needs_user", "commit_artifacts"))
+                feature_flow.resolve_finding(
+                    repo, "commit_artifacts", "leave uncommitted"
+                )
+                result = feature_flow.run_docs(repo, feature_flow.run_fake)
+
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(result["artifact_commit"], {"status": "skipped"})
+            self.assertEqual(
+                feature_flow.git(repo, "ls-files", str(feature_dir.relative_to(repo))),
+                "",
+            )
+
     def test_fake_loop_persists_logs_and_accepts(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
             repo, feature_dir = self._repo(directory)
             completed = subprocess.run(
-                [str(Path(feature_flow.__file__)), "run", "--repo", str(repo), "--fake"],
+                [sys.executable, "-m", "feature_flow", "run", "--repo", str(repo), "--fake"],
                 text=True,
                 capture_output=True,
                 env={**os.environ, "HOME": home},
@@ -304,6 +392,71 @@ class FeatureFlowTest(unittest.TestCase):
             self.assertEqual((result["status"], result["review_round"], reviews), ("needs_user", 3, 3))
             self.assertEqual(status["state"], "needs_user")
 
+    def test_minor_findings_accept_the_gate_and_stay_in_the_ledger(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
+            repo, feature_dir = self._repo(directory)
+            reviews = 0
+
+            def provider(model, effort, prompt, cwd, session_id=None):
+                nonlocal reviews
+                request = json.loads(prompt)
+                if request["CONTROL"]["role"] == "author":
+                    return feature_flow.run_fake(model, effort, prompt, cwd, session_id)
+                reviews += 1
+                return {
+                    "provider": "fake",
+                    "model": model,
+                    "effort": effort,
+                    "session_id": session_id or "review-session",
+                    "response": {
+                        "status": "needs_changes",
+                        "reviewed_artifact": request["TARGET"]["path"],
+                        "reviewed_hash": request["TARGET"]["hash"],
+                        "findings": [
+                            {"id": "N1", "severity": "minor", "issue": "wording"},
+                        ],
+                    },
+                    "returncode": 0,
+                }
+
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                result = feature_flow.run_requirements(repo, provider)
+                status = feature_flow.inspect_repo(repo, "requirements.md")
+            ledger = (feature_dir / "review-ledger.md").read_text()
+            self.assertEqual((result["status"], result["review_round"], reviews), ("accepted", 1, 1))
+            self.assertEqual(status["state"], "requirements_accepted")
+            self.assertIn("N1 minor: wording", ledger)
+            self.assertIn("open_items: none", ledger)
+
+    def test_reviewer_output_without_findings_stops_resumably(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
+            repo, _ = self._repo(directory)
+
+            def provider(model, effort, prompt, cwd, session_id=None):
+                request = json.loads(prompt)
+                if request["CONTROL"]["role"] == "author":
+                    return feature_flow.run_fake(model, effort, prompt, cwd, session_id)
+                return {
+                    "provider": "fake",
+                    "model": model,
+                    "effort": effort,
+                    "session_id": session_id or "review-session",
+                    "response": {
+                        "status": "needs_changes",
+                        "reviewed_artifact": request["TARGET"]["path"],
+                        "reviewed_hash": request["TARGET"]["hash"],
+                        "findings": [],
+                    },
+                    "returncode": 0,
+                }
+
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                result = feature_flow.run_requirements(repo, provider)
+                resolved = feature_flow.resolve_finding(repo, "reviewer_output", "Riprova la review")
+            self.assertEqual((result["status"], result["finding"]), ("needs_user", "reviewer_output"))
+            self.assertIn("resume_command", result)
+            self.assertEqual(resolved["status"], "resolved")
+
     def test_context_pack_uses_an_explicit_safe_allowlist(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, feature_dir = self._repo(directory)
@@ -328,20 +481,117 @@ class FeatureFlowTest(unittest.TestCase):
             )
         self.assertTrue(all(author["model"] != reviewer["model"] for author, reviewer in pairs))
 
+    def test_model_matrix_matches_policy(self):
+        config = feature_flow.load_config()
+        self.assertEqual(
+            {
+                name: {
+                    role: (
+                        config[name][role]["provider"],
+                        config[name][role]["model"],
+                        config[name][role]["effort"],
+                        config[name][role].get("sandbox"),
+                    )
+                    for role in ("author", "reviewer")
+                }
+                for name in ("docs", "code", "e2e")
+            },
+            {
+                "docs": {
+                    "author": ("codex", "gpt-5.6-sol", "xhigh", "workspace-write"),
+                    "reviewer": ("claude", "claude-opus-5", "high", None),
+                },
+                "code": {
+                    "author": ("codex", "gpt-5.6-terra", "xhigh", "workspace-write"),
+                    "reviewer": ("codex", "gpt-5.6-sol", "high", "read-only"),
+                },
+                "e2e": {
+                    "author": ("codex", "gpt-5.6-sol", "high", "workspace-write"),
+                    "reviewer": ("claude", "claude-opus-5", "xhigh", None),
+                },
+            },
+        )
+
+    def test_config_schema_is_packaged_and_versioned(self):
+        schema = json.loads(feature_flow.CONFIG_SCHEMA_PATH.read_text())
+        config = feature_flow.load_config()
+        self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        self.assertEqual(schema["properties"]["version"]["const"], feature_flow.CONFIG_VERSION)
+        self.assertEqual(config["version"], feature_flow.CONFIG_VERSION)
+
+    def test_config_validation_rejects_invalid_graphs_and_routes(self):
+        config = feature_flow.load_config()
+
+        duplicate = copy.deepcopy(config)
+        duplicate["docs"]["fallbacks"].append(
+            copy.deepcopy(duplicate["docs"]["fallbacks"][0])
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate fallback trigger"):
+            feature_flow.validate_config(duplicate)
+
+        unreachable = copy.deepcopy(config)
+        unreachable["docs"]["fallbacks"].append(
+            {
+                "on": {
+                    "role": "author",
+                    "provider": "codex",
+                    "model": "unreachable-model",
+                },
+                "stop": "needs_user",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "unreachable fallback trigger"):
+            feature_flow.validate_config(unreachable)
+
+        auto_review = copy.deepcopy(config)
+        auto_review["code"]["reviewer"] = copy.deepcopy(
+            auto_review["code"]["author"]
+        )
+        with self.assertRaisesRegex(ValueError, "must use different models"):
+            feature_flow.validate_config(auto_review)
+
+        missing_sandbox = copy.deepcopy(config)
+        missing_sandbox["docs"]["author"].pop("sandbox")
+        with self.assertRaisesRegex(ValueError, "is required for Codex"):
+            feature_flow.validate_config(missing_sandbox)
+
+    def test_validate_config_command_reports_valid_and_invalid_files(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(feature_flow.main(["validate-config"]), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(
+            (result["status"], result["version"], result["workflows"]),
+            ("valid", 1, ["docs", "code", "e2e"]),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            invalid = Path(directory) / "workflow.json"
+            invalid.write_text('{"version": 1}\n')
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    feature_flow.main(
+                        ["validate-config", "--config", str(invalid)]
+                    ),
+                    2,
+                )
+            self.assertEqual(json.loads(output.getvalue())["status"], "error")
+
     def test_configured_providers_drive_the_requirements_loop(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
             repo, _ = self._repo(directory)
 
-            def author(model, effort, prompt, cwd, session_id=None):
+            def author(model, effort, prompt, cwd, sandbox, session_id=None):
                 result = feature_flow.run_fake(model, effort, prompt, cwd, session_id)
-                result.update(ok=True, provider="claude")
+                result.update(ok=True, provider="codex")
                 return result
 
-            def reviewer(model, effort, prompt, cwd, sandbox, session_id=None):
+            def reviewer(model, effort, prompt, cwd, session_id=None):
                 request = json.loads(prompt)
                 return {
                     "ok": True,
-                    "provider": "codex",
+                    "provider": "claude",
                     "model": model,
                     "effort": effort,
                     "session_id": session_id or "codex-session",
@@ -355,24 +605,37 @@ class FeatureFlowTest(unittest.TestCase):
                 }
 
             with mock.patch.dict(os.environ, {"HOME": home}), mock.patch.object(
-                feature_flow, "run_claude", side_effect=author
-            ) as claude, mock.patch.object(feature_flow, "run_codex", side_effect=reviewer) as codex:
+                feature_flow, "run_codex", side_effect=author
+            ) as codex, mock.patch.object(feature_flow, "run_claude", side_effect=reviewer) as claude:
                 result = feature_flow.run_requirements(repo)
 
             self.assertEqual((result["status"], result["review_round"]), ("accepted", 1))
             self.assertEqual(claude.call_count, 1)
-            self.assertEqual(codex.call_args.args[4], "read-only")
+            self.assertEqual(codex.call_args.args[4], "workspace-write")
 
     def test_author_fallback_changes_both_roles_without_consuming_review(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
             repo, feature_dir = self._repo(directory)
+            workflow = feature_flow.load_config()["docs"]
+            primary = workflow["author"]
+            fallback = next(
+                transition["to"]
+                for transition in workflow["fallbacks"]
+                if transition["on"]
+                == {
+                    "role": "author",
+                    "provider": primary["provider"],
+                    "model": primary["model"],
+                }
+                and "to" in transition
+            )
             calls = []
 
             def provider(model, effort, prompt, cwd, session_id=None):
                 role = json.loads(prompt)["CONTROL"]["role"]
                 calls.append((role, model))
-                if model == "claude-fable-5":
-                    return self._failure("claude", model)
+                if model == primary["model"]:
+                    return self._failure(primary["provider"], model)
                 return feature_flow.run_fake(model, effort, prompt, cwd, session_id)
 
             with mock.patch.dict(os.environ, {"HOME": home}):
@@ -381,25 +644,42 @@ class FeatureFlowTest(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    ("author", "claude-fable-5"),
-                    ("author", "gpt-5.6-sol"),
-                    ("reviewer", "claude-opus-4-8"),
+                    ("author", primary["model"]),
+                    ("author", fallback["author"]["model"]),
+                    ("reviewer", fallback["reviewer"]["model"]),
                 ],
             )
             self.assertEqual((result["status"], result["review_round"]), ("accepted", 1))
             self.assertNotEqual(state["author_model"], state["reviewer_model"])
-            self.assertIn("failed_model: claude-fable-5", (feature_dir / "review-ledger.md").read_text())
+            self.assertIn(
+                f"failed_model: {primary['model']}",
+                (feature_dir / "review-ledger.md").read_text(),
+            )
 
-    def test_reviewer_fallback_uses_terra_without_counting_failed_sol(self):
+    def test_reviewer_fallback_does_not_count_the_failed_attempt(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
             repo, _ = self._repo(directory)
+            workflow = feature_flow.load_config()["docs"]
+            primary_author = workflow["author"]
+            primary_reviewer = workflow["reviewer"]
+            fallback = next(
+                transition["to"]
+                for transition in workflow["fallbacks"]
+                if transition["on"]
+                == {
+                    "role": "reviewer",
+                    "provider": primary_reviewer["provider"],
+                    "model": primary_reviewer["model"],
+                }
+                and "to" in transition
+            )
             calls = []
 
             def provider(model, effort, prompt, cwd, session_id=None):
                 role = json.loads(prompt)["CONTROL"]["role"]
                 calls.append((role, model))
-                if role == "reviewer" and model == "gpt-5.6-sol":
-                    return self._failure("codex", model)
+                if role == "reviewer" and model == primary_reviewer["model"]:
+                    return self._failure(primary_reviewer["provider"], model)
                 return feature_flow.run_fake(model, effort, prompt, cwd, session_id)
 
             with mock.patch.dict(os.environ, {"HOME": home}):
@@ -407,23 +687,41 @@ class FeatureFlowTest(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    ("author", "claude-fable-5"),
-                    ("reviewer", "gpt-5.6-sol"),
-                    ("reviewer", "gpt-5.6-terra"),
+                    ("author", primary_author["model"]),
+                    ("reviewer", primary_reviewer["model"]),
+                    ("reviewer", fallback["reviewer"]["model"]),
                 ],
             )
             self.assertEqual((result["status"], result["review_round"]), ("accepted", 1))
 
-    def test_author_fallback_chain_reaches_terra_then_opus(self):
+    def test_author_fallback_chain_stops_at_the_terminal_route(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
             repo, _ = self._repo(directory)
+            workflow = feature_flow.load_config()["docs"]
+            primary = workflow["author"]
+            fallback = next(
+                transition["to"]["author"]
+                for transition in workflow["fallbacks"]
+                if transition["on"]
+                == {
+                    "role": "author",
+                    "provider": primary["provider"],
+                    "model": primary["model"],
+                }
+                and "to" in transition
+            )
             calls = []
 
             def provider(model, effort, prompt, cwd, session_id=None):
                 role = json.loads(prompt)["CONTROL"]["role"]
                 calls.append((role, model))
-                if role == "author" and model in {"claude-fable-5", "gpt-5.6-sol"}:
-                    return self._failure("claude" if model.startswith("claude") else "codex", model)
+                if role == "author":
+                    provider_name = (
+                        primary["provider"]
+                        if model == primary["model"]
+                        else fallback["provider"]
+                    )
+                    return self._failure(provider_name, model)
                 return feature_flow.run_fake(model, effort, prompt, cwd, session_id)
 
             with mock.patch.dict(os.environ, {"HOME": home}):
@@ -431,24 +729,40 @@ class FeatureFlowTest(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    ("author", "claude-fable-5"),
-                    ("author", "gpt-5.6-sol"),
-                    ("author", "gpt-5.6-terra"),
-                    ("reviewer", "claude-opus-4-8"),
+                    ("author", primary["model"]),
+                    ("author", fallback["model"]),
                 ],
             )
-            self.assertEqual((result["status"], result["review_round"]), ("accepted", 1))
+            self.assertEqual((result["status"], result["review_round"]), ("needs_user", 0))
 
-    def test_terminal_fallback_stops_on_opus_failure(self):
+    def test_reviewer_fallback_chain_stops_at_the_terminal_route(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
             repo, _ = self._repo(directory)
+            workflow = feature_flow.load_config()["docs"]
+            primary = workflow["reviewer"]
+            fallback = next(
+                transition["to"]["reviewer"]
+                for transition in workflow["fallbacks"]
+                if transition["on"]
+                == {
+                    "role": "reviewer",
+                    "provider": primary["provider"],
+                    "model": primary["model"],
+                }
+                and "to" in transition
+            )
             calls = []
 
             def provider(model, effort, prompt, cwd, session_id=None):
                 role = json.loads(prompt)["CONTROL"]["role"]
                 calls.append((role, model))
-                if model in {"claude-fable-5", "claude-opus-4-8"}:
-                    return self._failure("claude", model)
+                if role == "reviewer":
+                    provider_name = (
+                        primary["provider"]
+                        if model == primary["model"]
+                        else fallback["provider"]
+                    )
+                    return self._failure(provider_name, model)
                 return feature_flow.run_fake(model, effort, prompt, cwd, session_id)
 
             with mock.patch.dict(os.environ, {"HOME": home}):
@@ -456,9 +770,12 @@ class FeatureFlowTest(unittest.TestCase):
                 status = feature_flow.inspect_repo(repo)
             self.assertEqual(result["status"], "needs_user")
             self.assertEqual(result["review_round"], 0)
-            self.assertEqual(calls[-1], ("reviewer", "claude-opus-4-8"))
-            self.assertEqual(calls.count(("reviewer", "claude-opus-4-8")), 1)
-            self.assertEqual(status["routing"]["reviewer"]["model"], "claude-opus-4-8")
+            self.assertEqual(calls[-1], ("reviewer", fallback["model"]))
+            self.assertEqual(calls.count(("reviewer", primary["model"])), 1)
+            self.assertEqual(
+                status["routing"]["reviewer"]["model"],
+                fallback["model"],
+            )
 
     def test_resolve_records_answer_and_resumes_both_sessions(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
@@ -600,10 +917,10 @@ class FeatureFlowTest(unittest.TestCase):
                 feature_flow.subprocess, "run", return_value=completed
             ) as execute:
                 result = feature_flow.run_claude(
-                    "claude-fable-5", "high", author_prompt, Path(directory)
+                    "claude-opus-5", "high", author_prompt, Path(directory)
                 )
                 resumed = feature_flow.run_claude(
-                    "claude-fable-5",
+                    "claude-opus-5",
                     "high",
                     author_prompt,
                     Path(directory),

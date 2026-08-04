@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "driven-development-workflow"
+version = "0.1.0"
+description = "Deterministic, review-driven feature workflow for Git repositories"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+feature-flow = "feature_flow:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = [
+  "feature_flow",
+  "feature_flow.prompts",
+  "feature_flow.templates",
+]
+
+[tool.setuptools.package-data]
+feature_flow = [
+  "workflow.json",
+  "workflow.schema.json",
+  "prompts/*.txt",
+  "templates/*.md",
+]
