@@ -86,5 +86,35 @@
   },
   "limits": {
     "max_reviews": 3
+  },
+  "routing": {
+    "mode": "shadow",
+    "classifier": {"provider": "openrouter", "model": "~typesafe/jev-latest", "timeout_s": 5},
+    "formula_version": 1,
+    "min_confidence": 0.7,
+    "underestimate_budget": 0.25,
+    "risk_threshold": 0.3,
+    "rounds_threshold": 0.5,
+    "effort_by_tier": {
+      "docs": {
+        "S": {"author": "medium", "reviewer": "high"},
+        "M": {"author": "high", "reviewer": "high"},
+        "L": {"author": "xhigh", "reviewer": "high"},
+        "XL": {"author": "xhigh", "reviewer": "xhigh"}
+      },
+      "code": {
+        "S": {"author": "medium", "reviewer": "high"},
+        "M": {"author": "high", "reviewer": "high"},
+        "L": {"author": "xhigh", "reviewer": "high"},
+        "XL": {"author": "xhigh", "reviewer": "xhigh"}
+      },
+      "e2e": {
+        "S": {"author": "medium", "reviewer": "high"},
+        "M": {"author": "high", "reviewer": "high"},
+        "L": {"author": "high", "reviewer": "xhigh"},
+        "XL": {"author": "xhigh", "reviewer": "xhigh"}
+      }
+    },
+    "reviewer_floor_on_risk": "xhigh"
   }
 }

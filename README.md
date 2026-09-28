@@ -246,6 +246,30 @@ Il runner:
 Non iniziare un gate `code` con modifiche applicative non correlate nel working
 tree: potrebbero entrare nel diff della feature.
 
+## Classificazione shadow delle task
+
+All'inizio di ogni gate il runner può classificare la difficoltà della task con
+[Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) tramite la
+Decisions API di OpenRouter. In modalità `shadow` (predefinita in
+`workflow.json`) la classificazione **non modifica** modelli ed effort: registra
+soltanto nel ledger il livello `S/M/L/XL`, i flag di rischio e l'effort che
+sarebbe stato suggerito, per poterne misurare la calibrazione.
+
+La classificazione è disattivata finché non si imposta una chiave dedicata:
+
+```bash
+export FEATURE_FLOW_OPENROUTER_API_KEY=sk-or-...
+```
+
+Con la chiave impostata vengono inviati a OpenRouter/TypeSafe estratti di
+roadmap, `requirements.md`, `plan.md` e statistiche del diff. Su repository
+aziendali verificare prima che l'invio sia consentito. Per disattivarla del
+tutto impostare `routing.mode` a `off`.
+
+Un errore del classificatore non blocca mai il gate. Richieste e risposte raw
+restano sotto `~/.local/state/feature-flow/`. Il design completo è in
+[`docs/model-routing-classifier.md`](docs/model-routing-classifier.md).
+
 ## Utilizzo da un'altra directory
 
 Non è necessario entrare nel repository consumer:

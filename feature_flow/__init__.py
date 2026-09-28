@@ -14,6 +14,20 @@ from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
 
+from .routing import (
+    EFFORT_ORDER,
+    FORMULA_VERSION,
+    ClassifierError,
+    ClassifierSkipped,
+    build_request,
+    classify,
+    fake_classifier,
+    input_hash,
+    openrouter_classifier,
+    parse_answers,
+    validate_routing,
+)
+
 
 CONFIG_PATH = Path(__file__).with_name("workflow.json")
 CONFIG_SCHEMA_PATH = Path(__file__).with_name("workflow.schema.json")
@@ -24,8 +38,14 @@ CONFIG_VERSION = 1
 WORKFLOW_NAMES = ("docs", "code", "e2e")
 ROLES = ("author", "reviewer")
 PROVIDERS = {"claude", "codex"}
-EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
+EFFORTS = set(EFFORT_ORDER)
 CODEX_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
+CLASSIFICATION_EXCERPT = 4000
+SENSITIVE_PATH_MARKERS = {
+    "security": ("auth", "security", "secret", "credential", "permission"),
+    "data_migration": ("migration",),
+}
+PREVIOUS_GATE = {"plan.md": "requirements.md", "code": "plan.md", "validation.md": "code"}
 
 
 class ProviderFailure(ValueError):
@@ -211,7 +231,7 @@ def validate_config(config: object) -> dict:
     validate_keys(
         config,
         {"version", *WORKFLOW_NAMES, "limits"},
-        set(),
+        {"routing"},
         "$",
     )
     if isinstance(config["version"], bool) or config["version"] != CONFIG_VERSION:
@@ -229,6 +249,8 @@ def validate_config(config: object) -> dict:
         raise config_error("$.limits.max_reviews", "must be an integer")
     if not 1 <= max_reviews <= 3:
         raise config_error("$.limits.max_reviews", "must be between 1 and 3")
+    if "routing" in config:
+        validate_routing(config["routing"], WORKFLOW_NAMES)
     return config
 
 
@@ -237,10 +259,14 @@ def load_config(path: Path | None = None) -> dict:
     return validate_config(json.loads(config_path.read_text()))
 
 
-def workflow_config(config: dict, unit: str) -> dict:
+def workflow_name(unit: str) -> str:
     if unit == "validation.md":
-        return config["e2e"]
-    return config["docs" if unit.endswith(".md") else unit]
+        return "e2e"
+    return "docs" if unit.endswith(".md") else unit
+
+
+def workflow_config(config: dict, unit: str) -> dict:
+    return config[workflow_name(unit)]
 
 
 def sha256(path: Path) -> str:
@@ -565,6 +591,10 @@ def inspect_repo(repo: Path, unit: str | None = None) -> dict:
         }
         if operational.get("finding"):
             result["operational"]["finding"] = operational["finding"].get("id", "unknown")
+        if operational.get("classification"):
+            result["operational"]["classification"] = {
+                key: operational["classification"].get(key) for key in ("status", "tier")
+            }
         if operational["status"] == "needs_user":
             result.update(state="needs_user", next={"action": "stop", "reason": "needs_user"})
             return result
@@ -737,6 +767,169 @@ def context_pack(
     if artifact:
         payload["TEMPLATE"] = (TEMPLATES_DIR / artifact.name).read_text()
     return json.dumps(payload, separators=(",", ":"))
+
+
+def text_excerpt(path: Path, limit: int = CLASSIFICATION_EXCERPT) -> str | None:
+    return path.read_text(errors="replace")[:limit] if path.is_file() else None
+
+
+def roadmap_excerpt(path: Path, branch: str) -> str | None:
+    if not path.is_file():
+        return None
+    text = path.read_text(errors="replace")
+    leaf = branch.rsplit("/", 1)[-1].lower()
+    matches = [block for block in re.split(r"\n\s*\n", text) if leaf in block.lower()]
+    return ("\n\n".join(matches) if matches else text)[:CLASSIFICATION_EXCERPT]
+
+
+def planned_paths(text: str) -> list[str]:
+    paths = re.findall(r"`([\w./-]+\.[A-Za-z0-9]+)`", text)
+    return sorted({path for path in paths if safe_code_path(path)})[:50]
+
+
+def path_risks(paths: list[str]) -> dict[str, list[str]]:
+    risks: dict[str, list[str]] = {}
+    for path in paths:
+        lowered = path.lower()
+        for flag, markers in SENSITIVE_PATH_MARKERS.items():
+            if any(marker in lowered for marker in markers):
+                risks.setdefault(flag, []).append(path)
+    return risks
+
+
+def previous_gate_rounds(ledger: Path, unit: str) -> int:
+    previous = PREVIOUS_GATE.get(unit)
+    if not previous or not ledger.is_file():
+        return 0
+    rounds = re.findall(
+        rf"(?m)^##\s+{re.escape(previous)} - round (\d+)\s*$",
+        ledger.read_text(errors="replace"),
+    )
+    return max(map(int, rounds), default=0)
+
+
+def classification_state(
+    root: Path, branch: str, unit: str, base_commit: str | None, ledger: Path
+) -> tuple[dict, set[str]]:
+    """Short, dense state for the classifier; counts come from the runner, not the model."""
+    feature_dir = root / "specs" / "features" / branch
+    state = {"gate": unit, "branch": branch}
+    signals = {"previous_gate_rounds": previous_gate_rounds(ledger, unit)}
+    paths: list[str] = []
+    if unit == "requirements.md":
+        state["roadmap"] = roadmap_excerpt(root / "specs" / "roadmap.md", branch)
+    elif unit == "plan.md":
+        state["requirements"] = text_excerpt(feature_dir / "requirements.md")
+    elif unit == "code":
+        plan = feature_dir / "plan.md"
+        state["plan"] = text_excerpt(plan)
+        paths = planned_paths(plan.read_text(errors="replace")) if plan.is_file() else []
+        signals["planned_files"] = len(paths)
+    else:
+        state["plan"] = text_excerpt(feature_dir / "plan.md", CLASSIFICATION_EXCERPT // 2)
+        paths, _ = code_paths(root, base_commit)
+        lines = 0
+        for row in git(root, "diff", "--numstat", base_commit, "--").splitlines():
+            added, removed, name = row.split("\t", 2)
+            if safe_code_path(name) and added.isdigit() and removed.isdigit():
+                lines += int(added) + int(removed)
+        signals.update(changed_files=len(paths), lines_changed=lines)
+    if paths:
+        signals["languages"] = sorted({Path(path).suffix for path in paths if Path(path).suffix})
+    risks = path_risks(paths)
+    signals["sensitive_paths"] = sorted({path for flagged in risks.values() for path in flagged})
+    state["signals"] = signals
+    return state, set(risks)
+
+
+def append_classification(ledger: Path, unit: str, record: dict) -> None:
+    lines = [
+        f"## {unit} - classification",
+        f"unit: {unit}",
+        f"mode: {record['mode']}",
+        f"status: {record['status']}",
+        f"classifier_model: {record['classifier_model']}",
+        f"formula_version: {record['formula_version']}",
+        f"input_hash: {record.get('input_hash') or 'none'}",
+    ]
+    if record["status"] == "classified":
+        lines += [
+            f"tier: {record['tier']}",
+            "tier_probs: " + json.dumps(record["tier_probs"], separators=(",", ":")),
+            "risk_flags: " + (",".join(record["risk_flags"]) or "none"),
+            f"confidence: {record['confidence']}",
+            f"suggested_author_effort: {record['suggested_effort']['author']}",
+            f"suggested_reviewer_effort: {record['suggested_effort']['reviewer']}",
+            f"static_author_effort: {record['static_effort']['author']}",
+            f"static_reviewer_effort: {record['static_effort']['reviewer']}",
+            f"applied: {str(record['applied']).lower()}",
+            "answers: " + json.dumps(record["answers"], separators=(",", ":")),
+        ]
+    else:
+        lines.append(f"reason: {record['reason']}")
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with ledger.open("a") as output:
+        if ledger.stat().st_size:
+            output.write("\n")
+        output.write("\n".join(lines) + "\n")
+
+
+def shadow_classification(
+    root: Path,
+    branch: str,
+    unit: str,
+    base_commit: str | None,
+    ledger: Path,
+    state_dir: Path,
+    config: dict,
+    classifier,
+) -> dict | None:
+    """Classify the gate without changing its routes; failures never stop the run."""
+    routing = config.get("routing")
+    if not routing or routing["mode"] == "off":
+        return None
+    workflow = workflow_config(config, unit)
+    record = {
+        "mode": routing["mode"],
+        "classifier_model": routing["classifier"]["model"],
+        "formula_version": FORMULA_VERSION,
+        "static_effort": {role: workflow[role]["effort"] for role in ROLES},
+        "applied": False,
+    }
+    request = raw = None
+    try:
+        classifier_state, deterministic_risks = classification_state(
+            root, branch, unit, base_commit, ledger
+        )
+        request = build_request(routing["classifier"]["model"], classifier_state)
+        record["input_hash"] = input_hash(request)
+        raw = classifier(request, routing["classifier"]["timeout_s"])
+        record["answers"] = parse_answers(raw)
+        record.update(
+            status="classified",
+            **classify(
+                record["answers"],
+                routing,
+                workflow_name(unit),
+                record["static_effort"],
+                deterministic_risks,
+            ),
+        )
+    except ClassifierSkipped as error:
+        record.update(status="skipped", reason=str(error))
+        return record
+    except (OSError, ValueError) as error:
+        reason = str(error) if isinstance(error, ClassifierError) else type(error).__name__
+        record.update(status="error", reason=reason)
+    if record.get("input_hash"):
+        log_dir = state_dir / "classifications"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        write_json(
+            log_dir / f"{Path(unit).stem}-{record['input_hash'][7:19]}.json",
+            {"request": request, "response": raw, "record": record},
+        )
+    append_classification(ledger, unit, record)
+    return record
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -1238,6 +1431,10 @@ def public_state(state: dict, state_dir: Path) -> dict:
         )
     elif state["unit"] == "validation.md":
         result["tests_run"] = len(state.get("tests", []))
+    if state.get("classification"):
+        result["classification"] = {
+            key: state["classification"].get(key) for key in ("status", "tier")
+        }
         if state.get("artifact_commit"):
             result["artifact_commit"] = state["artifact_commit"]
     if state.get("finding"):
@@ -1307,7 +1504,7 @@ def resolve_finding(repo: Path, finding_id: str, answer: str) -> dict:
     }
 
 
-def run_artifact(repo: Path, unit: str, provider=None) -> dict:
+def run_artifact(repo: Path, unit: str, provider=None, classifier=None) -> dict:
     observed = inspect_repo(repo, unit)
     if observed["state"] in {"idle", "corrupt"}:
         return {"status": observed["state"], "next": observed["next"]}
@@ -1377,6 +1574,13 @@ def run_artifact(repo: Path, unit: str, provider=None) -> dict:
                 state.update(base_commit=base_commit, tests=[])
             if unit == "validation.md":
                 state["accepted_code_hash"] = observed["code_hash"]
+            if classifier is None:
+                classifier = fake_classifier if provider is not None else openrouter_classifier
+            classification = shadow_classification(
+                root, branch, unit, base_commit, ledger, state_dir, config, classifier
+            )
+            if classification:
+                state["classification"] = classification
         state.setdefault("author_route", dict(workflow["author"]))
         state.setdefault("reviewer_route", dict(workflow["reviewer"]))
         state.setdefault("fallbacks", [])
@@ -1675,15 +1879,15 @@ def run_artifact(repo: Path, unit: str, provider=None) -> dict:
         return public_state(state, state_dir)
 
 
-def run_requirements(repo: Path, provider=None) -> dict:
-    return run_artifact(repo, "requirements.md", provider)
+def run_requirements(repo: Path, provider=None, classifier=None) -> dict:
+    return run_artifact(repo, "requirements.md", provider, classifier)
 
 
-def run_docs(repo: Path, provider=None) -> dict:
+def run_docs(repo: Path, provider=None, classifier=None) -> dict:
     observed = inspect_repo(repo)
     if observed["state"] in {"idle", "corrupt"}:
         return {"status": observed["state"], "next": observed["next"]}
-    return run_artifact(repo, Path(observed["artifact"]["path"]).name, provider)
+    return run_artifact(repo, Path(observed["artifact"]["path"]).name, provider, classifier)
 
 
 def parser() -> argparse.ArgumentParser:

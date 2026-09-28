@@ -1,6 +1,7 @@
 # Routing adattivo di modello ed effort tramite classificatore
 
-Stato: **proposta** (nessuna modifica al runner).
+Stato: **Fase 1 in modalità `shadow` implementata** (`feature_flow/routing.py`);
+`advisory`, `enforced` e Fase 2 restano proposte.
 Data: 2026-09-28.
 
 ## Problema
@@ -267,7 +268,27 @@ può:
   (`routing.classifier`) e non entra nell'enum `provider` delle route, quindi
   `validate-config` sulle matrici non cambia.
 - Chiamata HTTP con la libreria standard (`urllib`), coerente con l'assenza di
-  dipendenze del runner; chiave da `OPENROUTER_API_KEY`, mai da `workflow.json`.
+  dipendenze del runner; chiave da `FEATURE_FLOW_OPENROUTER_API_KEY`, mai da
+  `workflow.json`. Si usa una variabile dedicata e non `OPENROUTER_API_KEY` perché
+  quest'ultima è spesso già impostata per altri strumenti: l'invio di estratti del
+  repository a terzi deve essere una scelta esplicita per questo runner.
+
+### Stato dell'implementazione (Fase 1, `shadow`)
+
+- `routing.mode` accetta `off` e `shadow`; `advisory`/`enforced` sono rifiutati da
+  `validate-config` finché non implementati.
+- La classificazione avviene alla creazione dello stato di ogni gate, dentro il lock.
+- Senza chiave API il classificatore risulta `skipped`: nessuna chiamata di rete e nessun
+  blocco nel ledger. Con chiave, esito `classified` o `error`: in entrambi i casi il
+  blocco `## <unit> - classification` finisce nel ledger (senza campo `artifact:`, così
+  non interferisce con `gate_accepted`).
+- Richiesta, risposta raw e record sono salvati localmente in
+  `<state_dir>/classifications/`; nel ledger (versionato) vanno solo probabilità,
+  livello e suggerimenti, non gli estratti inviati.
+- Le domande sono inviate in inglese; il significato è quello della tabella sopra.
+- Il parser accetta le risposte al primo livello o sotto `answers`/`decisions`, finché
+  l'envelope non è verificato sulla documentazione ufficiale.
+- `--fake` e i test usano `fake_classifier`, con lo stesso envelope dell'API.
 
 ## Modalità di rilascio
 

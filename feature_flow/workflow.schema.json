@@ -29,9 +29,88 @@
           "maximum": 3
         }
       }
+    },
+    "routing": {
+      "$ref": "#/$defs/routing"
     }
   },
   "$defs": {
+    "effort": {
+      "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    "probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "tierEfforts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["author", "reviewer"],
+      "properties": {
+        "author": {"$ref": "#/$defs/effort"},
+        "reviewer": {"$ref": "#/$defs/effort"}
+      }
+    },
+    "tiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["S", "M", "L", "XL"],
+      "properties": {
+        "S": {"$ref": "#/$defs/tierEfforts"},
+        "M": {"$ref": "#/$defs/tierEfforts"},
+        "L": {"$ref": "#/$defs/tierEfforts"},
+        "XL": {"$ref": "#/$defs/tierEfforts"}
+      }
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "classifier",
+        "formula_version",
+        "min_confidence",
+        "underestimate_budget",
+        "risk_threshold",
+        "rounds_threshold",
+        "effort_by_tier",
+        "reviewer_floor_on_risk"
+      ],
+      "properties": {
+        "mode": {
+          "enum": ["off", "shadow"]
+        },
+        "classifier": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "model", "timeout_s"],
+          "properties": {
+            "provider": {"enum": ["openrouter"]},
+            "model": {"type": "string", "minLength": 1},
+            "timeout_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 60}
+          }
+        },
+        "formula_version": {
+          "const": 1
+        },
+        "min_confidence": {"$ref": "#/$defs/probability"},
+        "underestimate_budget": {"$ref": "#/$defs/probability"},
+        "risk_threshold": {"$ref": "#/$defs/probability"},
+        "rounds_threshold": {"$ref": "#/$defs/probability"},
+        "effort_by_tier": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["docs", "code", "e2e"],
+          "properties": {
+            "docs": {"$ref": "#/$defs/tiers"},
+            "code": {"$ref": "#/$defs/tiers"},
+            "e2e": {"$ref": "#/$defs/tiers"}
+          }
+        },
+        "reviewer_floor_on_risk": {"$ref": "#/$defs/effort"}
+      }
+    },
     "route": {
       "type": "object",
       "additionalProperties": false,
